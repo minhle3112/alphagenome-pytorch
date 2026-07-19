@@ -876,6 +876,11 @@ def main() -> None:
     if isinstance(modality, list):
         modality = modality[0]  # single-task evaluation
     resolutions = tuple(ckpt_meta["resolutions"])
+
+    if any(isinstance(r, str) for r in resolutions):
+        log.warning(f"Corrupted string detected in resolutions {resolutions}. Overriding to (1,).")
+        resolutions = (1, 128)
+
     track_names = ckpt_meta["track_names"]
     if isinstance(track_names, dict):
         track_names = track_names.get(modality, [])
