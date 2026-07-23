@@ -121,6 +121,7 @@ def evaluate_split(
     Predictions are in experimental space (unscaled).
     """
     model.eval()
+    model = torch.compile(model)
     head = model.heads[modality]
 
     preds_by_res: dict[int, list[np.ndarray]] = {r: [] for r in resolutions}
@@ -253,13 +254,27 @@ def jsd_per_region(
     Returns:
         (N, n_tracks) array of JSD values.
     """
-    # Normalize along position axis to get probability distributions
-    p = targets / (targets.sum(axis=1, keepdims=True) + eps)
-    q = preds / (preds.sum(axis=1, keepdims=True) + eps)
-    m = 0.5 * (p + q)
-    kl_pm = np.sum(p * np.log((p + eps) / (m + eps)), axis=1)
-    kl_qm = np.sum(q * np.log((q + eps) / (m + eps)), axis=1)
-    return 0.5 * (kl_pm + kl_qm)
+    n_regions, seq_len, n_tracks = preds.shape
+    jsd_vals = np.zeros((n_regions, n_tracks), dtype=np.float32)
+    
+    # Process one region at a time to prevent massive memory allocation spikes
+    for i in range(n_regions):
+        p = targets[i] / (targets[i].sum(axis=0, keepdims=True) + eps)
+        q = preds[i] / (preds[i].sum(axis=0, keepdims=True) + eps)
+        m = 0.5 * (p + q)
+        kl_pm = np.sum(p * np.log((p + eps) / (m + eps)), axis=0) # seq_len is now at axis 0, not 1 since n_regions is gone from the shape
+        kl_qm = np.sum(q * np.log((q + eps) / (m + eps)), axis=0)
+        jsd_vals[i] = 0.5 * (kl_pm + kl_qm)
+        
+    return jsd_vals
+
+    # # Normalize along position axis to get probability distributions
+    # p = targets / (targets.sum(axis=1, keepdims=True) + eps)
+    # q = preds / (preds.sum(axis=1, keepdims=True) + eps)
+    # m = 0.5 * (p + q)
+    # kl_pm = np.sum(p * np.log((p + eps) / (m + eps)), axis=1)
+    # kl_qm = np.sum(q * np.log((q + eps) / (m + eps)), axis=1)
+    # return 0.5 * (kl_pm + kl_qm)
 
 
 def compute_all_metrics(
@@ -303,14 +318,23 @@ def compute_all_metrics(
     jsd_per_reg = jsd_vals.mean(axis=1)  # (N,)
 
     # Global metrics (subsample for speed)
-    p_flat = preds.flatten()
-    t_flat = targets.flatten()
-    if len(p_flat) > 2_000_000:
-        idx = np.random.default_rng(42).choice(
-            len(p_flat), 2_000_000, replace=False,
-        )
-        p_flat = p_flat[idx]
-        t_flat = t_flat[idx]
+    total_elements = preds.size
+    sample_size = min(total_elements, 2_000_000)
+
+    idx_1d = np.random.default_rng(42).choice(total_elements, sample_size, replace=False)
+    idx_3d = np.unravel_index(idx_1d, preds.shape)
+
+    p_flat = preds[idx_3d]
+    t_flat = targets[idx_3d]
+
+    # p_flat = preds.flatten()
+    # t_flat = targets.flatten()
+    # if len(p_flat) > 2_000_000:
+    #     idx = np.random.default_rng(42).choice(
+    #         len(p_flat), 2_000_000, replace=False,
+    #     )
+    #    p_flat = p_flat[idx]
+    #   t_flat = t_flat[idx]
 
     spearman_global = stats.spearmanr(p_flat, t_flat)[0]
     mse = float(np.mean((preds - targets) ** 2))
@@ -824,7 +848,7 @@ def main() -> None:
     resolutions = tuple(ckpt_meta["resolutions"])
 
     if any(isinstance(r, str) for r in resolutions):
-        log.warning(f"Corrupted string detected in resolutions {resolutions}. Overriding to (1,).")
+        log.warning(f"Corrupted string detected in resolutions {resolutions}. Overriding to (1,128).")
         resolutions = (1, 128)
 
     track_names = ckpt_meta["track_names"]
